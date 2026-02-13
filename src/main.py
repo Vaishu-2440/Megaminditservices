@@ -1,10 +1,14 @@
 """Round-1 coding assignment implementation.
 
-This script implements:
-1. Baseline models and one proposed model.
-2. Cross-validation and train/test evaluation.
-3. Comparison on balanced and imbalanced datasets.
-4. Result visualizations and exportable tables.
+Implements all requested items from the assignment sheets:
+- selected-paper-aware objective framing,
+- unique proposed algorithm,
+- baseline + traditional + proposed comparisons,
+- balanced vs. imbalanced evaluation,
+- cross-validation with metrics beyond accuracy,
+- feature-selection ablation,
+- time/space complexity estimation,
+- output tables and figures for report inclusion.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator, ClassifierMixin, clone
 from sklearn.compose import ColumnTransformer
 from sklearn.datasets import load_breast_cancer
 from sklearn.ensemble import RandomForestClassifier, VotingClassifier
@@ -26,7 +30,10 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     ConfusionMatrixDisplay,
     accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
     f1_score,
+    matthews_corrcoef,
     precision_score,
     recall_score,
     roc_auc_score,
@@ -37,42 +44,43 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
 RANDOM_STATE = 42
+SELECTED_PAPER = (
+    "Saito & Rehmsmeier (2015) - Precision-Recall plot is more informative than ROC under "
+    "class imbalance"
+)
 
 
 @dataclass(frozen=True)
 class EvaluationResult:
     dataset_variant: str
     model_name: str
+    strategy: str
     accuracy: float
+    balanced_accuracy: float
     precision: float
     recall: float
     f1: float
     roc_auc: float
-    cv_accuracy_mean: float
-    cv_accuracy_std: float
+    pr_auc: float
+    mcc: float
+    cv_f1_mean: float
+    cv_f1_std: float
     train_time_sec: float
+    infer_time_sec: float
 
 
 class ProposedHybridClassifier(BaseEstimator, ClassifierMixin):
-    """Proposed algorithm: MI-based feature selection + weighted soft-voting stack.
+    """HybridFS-Stack++: MI-based feature selection + weighted soft voting ensemble."""
 
-    Steps:
-    1) Standardize all numeric features.
-    2) Select top-k informative features by mutual information.
-    3) Fit three diverse learners and combine using weighted soft voting.
-    """
-
-    def __init__(self, k_features: int = 15):
+    def __init__(self, k_features: int = 15, use_feature_selection: bool = True):
         self.k_features = k_features
+        self.use_feature_selection = use_feature_selection
         self.pipeline_: Pipeline | None = None
 
     def _build_pipeline(self) -> Pipeline:
-        numeric_transformer = Pipeline(
-            steps=[("scaler", StandardScaler())]
-        )
+        numeric_transformer = Pipeline(steps=[("scaler", StandardScaler())])
         preprocessor = ColumnTransformer(
-            transformers=[("num", numeric_transformer, slice(0, None))],
-            remainder="drop",
+            transformers=[("num", numeric_transformer, slice(0, None))], remainder="drop"
         )
 
         voting = VotingClassifier(
@@ -86,13 +94,11 @@ class ProposedHybridClassifier(BaseEstimator, ClassifierMixin):
             n_jobs=-1,
         )
 
-        return Pipeline(
-            steps=[
-                ("preprocessor", preprocessor),
-                ("select", SelectKBest(score_func=mutual_info_classif, k=self.k_features)),
-                ("model", voting),
-            ]
-        )
+        steps = [("preprocessor", preprocessor)]
+        if self.use_feature_selection:
+            steps.append(("select", SelectKBest(score_func=mutual_info_classif, k=self.k_features)))
+        steps.append(("model", voting))
+        return Pipeline(steps=steps)
 
     def fit(self, X: pd.DataFrame, y: pd.Series):
         self.pipeline_ = self._build_pipeline()
@@ -111,7 +117,6 @@ def load_datasets() -> dict[str, tuple[pd.DataFrame, pd.Series]]:
     X = dataset.data
     y = dataset.target
 
-    # Create an intentionally imbalanced version to test robustness.
     full_df = X.copy()
     full_df["target"] = y
     minority = full_df[full_df["target"] == 1].sample(frac=0.25, random_state=RANDOM_STATE)
@@ -124,39 +129,67 @@ def load_datasets() -> dict[str, tuple[pd.DataFrame, pd.Series]]:
     }
 
 
-def build_baseline_models() -> dict[str, Pipeline]:
-    def pipeline_with_scaler(model):
+def build_models() -> dict[str, tuple[str, BaseEstimator]]:
+    def with_scaler(model):
         return Pipeline(steps=[("scaler", StandardScaler()), ("model", model)])
 
     return {
-        "LogisticRegression": pipeline_with_scaler(
-            LogisticRegression(max_iter=2000, random_state=RANDOM_STATE)
+        "Traditional-LogReg": (
+            "traditional",
+            with_scaler(LogisticRegression(max_iter=2000, random_state=RANDOM_STATE)),
         ),
-        "SVM-RBF": pipeline_with_scaler(
-            SVC(probability=True, kernel="rbf", random_state=RANDOM_STATE)
+        "Traditional-SVM-RBF": (
+            "traditional",
+            with_scaler(SVC(probability=True, kernel="rbf", random_state=RANDOM_STATE)),
         ),
-        "RandomForest": Pipeline(
-            steps=[("model", RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE))]
+        "Traditional-RandomForest": (
+            "traditional",
+            Pipeline([("model", RandomForestClassifier(n_estimators=300, random_state=RANDOM_STATE))]),
         ),
-        "Proposed-HybridFS-Stack": ProposedHybridClassifier(k_features=15),
+        "Proposed-HybridFS-Stack++": (
+            "proposed",
+            ProposedHybridClassifier(k_features=15, use_feature_selection=True),
+        ),
+        "Ablation-Hybrid-NoFS": (
+            "ablation",
+            ProposedHybridClassifier(k_features=15, use_feature_selection=False),
+        ),
     }
 
 
-def evaluate_model(model, X_train, X_test, y_train, y_test, dataset_variant: str, model_name: str) -> EvaluationResult:
-    start = perf_counter()
-    model.fit(X_train, y_train)
-    train_time = perf_counter() - start
+def estimate_complexity(model_name: str, n_samples: int, n_features: int) -> tuple[str, str]:
+    if "LogReg" in model_name:
+        return (f"O({n_samples}*{n_features})", f"O({n_features})")
+    if "SVM" in model_name:
+        return (f"~O({n_samples}^2*{n_features})", f"O({n_samples}^2)")
+    if "RandomForest" in model_name:
+        return (f"O(trees*{n_samples}*log({n_samples})*{n_features})", "O(trees*nodes)")
+    if "Hybrid" in model_name:
+        return (
+            "O(MI feature selection + LR + RF + SVM training)",
+            "O(selected_features + ensemble params)",
+        )
+    return ("N/A", "N/A")
 
-    pred = model.predict(X_test)
-    proba = model.predict_proba(X_test)[:, 1]
+
+def evaluate_model(model, X_train, X_test, y_train, y_test, dataset_variant: str, model_name: str, strategy: str) -> EvaluationResult:
+    model_for_train = clone(model)
+    start_train = perf_counter()
+    model_for_train.fit(X_train, y_train)
+    train_time = perf_counter() - start_train
+
+    start_infer = perf_counter()
+    pred = model_for_train.predict(X_test)
+    proba = model_for_train.predict_proba(X_test)[:, 1]
+    infer_time = perf_counter() - start_infer
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
     cv_scores = cross_validate(
-        model,
+        clone(model),
         X_train,
         y_train,
         cv=cv,
-        scoring="accuracy",
+        scoring={"f1": "f1", "roc_auc": "roc_auc"},
         n_jobs=-1,
         error_score="raise",
     )
@@ -164,79 +197,115 @@ def evaluate_model(model, X_train, X_test, y_train, y_test, dataset_variant: str
     return EvaluationResult(
         dataset_variant=dataset_variant,
         model_name=model_name,
+        strategy=strategy,
         accuracy=accuracy_score(y_test, pred),
+        balanced_accuracy=balanced_accuracy_score(y_test, pred),
         precision=precision_score(y_test, pred, zero_division=0),
         recall=recall_score(y_test, pred, zero_division=0),
         f1=f1_score(y_test, pred, zero_division=0),
         roc_auc=roc_auc_score(y_test, proba),
-        cv_accuracy_mean=float(cv_scores["test_score"].mean()),
-        cv_accuracy_std=float(cv_scores["test_score"].std()),
+        pr_auc=average_precision_score(y_test, proba),
+        mcc=matthews_corrcoef(y_test, pred),
+        cv_f1_mean=float(cv_scores["test_f1"].mean()),
+        cv_f1_std=float(cv_scores["test_f1"].std()),
         train_time_sec=float(train_time),
+        infer_time_sec=float(infer_time),
     )
 
 
-def save_comparison_plot(results_df: pd.DataFrame, output_dir: Path) -> None:
+def save_plots(results_df: pd.DataFrame, best_models: dict[str, BaseEstimator], tests: dict[str, tuple[pd.DataFrame, pd.Series]], output_dir: Path) -> None:
     plt.figure(figsize=(12, 6))
     sns.barplot(data=results_df, x="model_name", y="f1", hue="dataset_variant")
-    plt.title("F1 Score Comparison Across Models and Dataset Variants")
-    plt.xlabel("Model")
-    plt.ylabel("F1 Score")
-    plt.ylim(0.7, 1.0)
-    plt.xticks(rotation=15)
+    plt.title("F1 Comparison: Existing vs Proposed vs Ablation")
+    plt.xticks(rotation=20)
     plt.tight_layout()
     plt.savefig(output_dir / "figures" / "f1_comparison.png", dpi=160)
     plt.close()
 
+    plt.figure(figsize=(12, 6))
+    sns.barplot(data=results_df, x="model_name", y="pr_auc", hue="dataset_variant")
+    plt.title("PR-AUC Comparison (Imbalance-sensitive metric)")
+    plt.xticks(rotation=20)
+    plt.tight_layout()
+    plt.savefig(output_dir / "figures" / "prauc_comparison.png", dpi=160)
+    plt.close()
 
-def save_confusion_matrix(best_model, X_test, y_test, output_dir: Path, name: str) -> None:
-    fig, ax = plt.subplots(figsize=(5, 4))
-    ConfusionMatrixDisplay.from_estimator(best_model, X_test, y_test, cmap="Blues", ax=ax)
-    ax.set_title(f"Confusion Matrix ({name})")
-    fig.tight_layout()
-    fig.savefig(output_dir / "figures" / f"cm_{name}.png", dpi=160)
-    plt.close(fig)
+    for variant, model in best_models.items():
+        X_test, y_test = tests[variant]
+        fig, ax = plt.subplots(figsize=(5, 4))
+        ConfusionMatrixDisplay.from_estimator(model, X_test, y_test, cmap="Blues", ax=ax)
+        ax.set_title(f"Confusion Matrix ({variant})")
+        fig.tight_layout()
+        fig.savefig(output_dir / "figures" / f"cm_best_{variant}.png", dpi=160)
+        plt.close(fig)
 
 
 def main() -> None:
     output_dir = Path("outputs")
-    output_dir.mkdir(exist_ok=True)
-    (output_dir / "figures").mkdir(exist_ok=True)
+    (output_dir / "figures").mkdir(parents=True, exist_ok=True)
 
     datasets = load_datasets()
-    models = build_baseline_models()
-
-    all_results: list[EvaluationResult] = []
+    models = build_models()
+    results: list[EvaluationResult] = []
+    complexity_rows: list[dict[str, str]] = []
+    best_models: dict[str, BaseEstimator] = {}
+    test_partitions: dict[str, tuple[pd.DataFrame, pd.Series]] = {}
 
     for variant, (X, y) in datasets.items():
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.25, stratify=y, random_state=RANDOM_STATE
         )
+        test_partitions[variant] = (X_test, y_test)
 
-        best_model_name = ""
-        best_model_instance = None
         best_f1 = -1.0
+        best_fitted = None
 
-        for model_name, model in models.items():
-            result = evaluate_model(model, X_train, X_test, y_train, y_test, variant, model_name)
-            all_results.append(result)
+        for model_name, (strategy, model) in models.items():
+            result = evaluate_model(model, X_train, X_test, y_train, y_test, variant, model_name, strategy)
+            results.append(result)
 
+            train_c, space_c = estimate_complexity(model_name, len(X_train), X_train.shape[1])
+            complexity_rows.append(
+                {
+                    "dataset_variant": variant,
+                    "model_name": model_name,
+                    "train_complexity": train_c,
+                    "space_complexity": space_c,
+                }
+            )
+
+            fitted = clone(model).fit(X_train, y_train)
             if result.f1 > best_f1:
                 best_f1 = result.f1
-                best_model_name = model_name
-                best_model_instance = model
+                best_fitted = fitted
 
-        save_confusion_matrix(best_model_instance, X_test, y_test, output_dir, f"{variant}_{best_model_name}")
+        best_models[variant] = best_fitted
 
-    results_df = pd.DataFrame([r.__dict__ for r in all_results]).sort_values(
-        by=["dataset_variant", "f1"], ascending=[True, False]
+    results_df = pd.DataFrame([r.__dict__ for r in results]).sort_values(
+        ["dataset_variant", "f1"], ascending=[True, False]
     )
-    results_df.to_csv(output_dir / "metrics_summary.csv", index=False)
-    save_comparison_plot(results_df, output_dir)
+    complexity_df = pd.DataFrame(complexity_rows).drop_duplicates()
 
+    recommendation_df = (
+        results_df.sort_values(["dataset_variant", "f1"], ascending=[True, False])
+        .groupby("dataset_variant")
+        .head(1)
+        .loc[:, ["dataset_variant", "model_name", "strategy", "f1", "pr_auc", "recall", "cv_f1_mean"]]
+    )
+
+    results_df.to_csv(output_dir / "metrics_summary.csv", index=False)
+    complexity_df.to_csv(output_dir / "complexity_summary.csv", index=False)
+    recommendation_df.to_csv(output_dir / "final_recommendations.csv", index=False)
+    save_plots(results_df, best_models, test_partitions, output_dir)
+
+    print(f"Selected guiding paper: {SELECTED_PAPER}")
     print("Saved outputs:")
     print("- outputs/metrics_summary.csv")
+    print("- outputs/complexity_summary.csv")
+    print("- outputs/final_recommendations.csv")
     print("- outputs/figures/f1_comparison.png")
-    print("- outputs/figures/cm_*.png")
+    print("- outputs/figures/prauc_comparison.png")
+    print("- outputs/figures/cm_best_*.png")
 
 
 if __name__ == "__main__":
